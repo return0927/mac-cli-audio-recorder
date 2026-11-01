@@ -24,11 +24,25 @@ final class Recorder {
     private var _heardSound = false
     private var _writeError: Error?
 
+    /// Start-on-sound: nil = record immediately.
+    struct Trigger {
+        /// Linear peak (0...1) a buffer must reach to start recording.
+        var threshold: Float
+        /// Seconds of audio kept from just before the trigger, so the attack isn't cut off.
+        var preRoll: Double
+    }
+    private let trigger: Trigger?
+    private var _triggeredAt: Date?
+    private var preRollBuffers: [AVAudioPCMBuffer] = []
+    private var preRollFrames: AVAudioFrameCount = 0
+
     private(set) var format: AVAudioFormat!
     private(set) var tappedProcesses: [AudioObjectID] = []
 
-    init(matcher: (() -> [AudioObjectID])?) {
+    init(matcher: (() -> [AudioObjectID])?, trigger: Trigger? = nil) {
         self.matcher = matcher
+        self.trigger = trigger
+        if trigger == nil { _triggeredAt = Date() }
     }
 
     // MARK: - Stats (read from the UI timer)
@@ -38,6 +52,8 @@ final class Recorder {
     var framesWritten: Int64 { lock.withLock { _frames } }
     var heardSound: Bool { lock.withLock { _heardSound } }
     var writeError: Error? { lock.withLock { _writeError } }
+    /// When recording actually started (nil while waiting for sound).
+    var triggeredAt: Date? { lock.withLock { _triggeredAt } }
 
     // MARK: - Start / stop
 
@@ -138,15 +154,51 @@ final class Recorder {
         }
 
         lock.withLock {
-            guard let file else { return }
-            do {
-                try file.write(from: buffer)
-                _frames += Int64(buffer.frameLength)
-            } catch {
-                _writeError = error
-            }
             _peak = max(_peak, peak)
+            guard let file else { return }
+
+            if _triggeredAt == nil, let trigger {
+                guard peak >= trigger.threshold else {
+                    keepForPreRoll(buffer, seconds: trigger.preRoll)
+                    return
+                }
+                _triggeredAt = Date()
+                for b in preRollBuffers { write(b, to: file) }
+                preRollBuffers = []
+            }
+
+            write(buffer, to: file)
             if peak > 0 { _heardSound = true }
+        }
+    }
+
+    /// Call with `lock` held.
+    private func write(_ buffer: AVAudioPCMBuffer, to file: AVAudioFile) {
+        do {
+            try file.write(from: buffer)
+            _frames += Int64(buffer.frameLength)
+        } catch {
+            _writeError = error
+        }
+    }
+
+    /// Ring of the most recent `seconds` of audio (copied — the IO buffer is reused). Call with `lock` held.
+    private func keepForPreRoll(_ buffer: AVAudioPCMBuffer, seconds: Double) {
+        let limit = AVAudioFrameCount(seconds * format.sampleRate)
+        guard limit > 0,
+              let copy = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: buffer.frameLength) else { return }
+        copy.frameLength = buffer.frameLength
+        let src = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: buffer.audioBufferList))
+        let dst = UnsafeMutableAudioBufferListPointer(copy.mutableAudioBufferList)
+        for (s, d) in zip(src, dst) {
+            guard let sd = s.mData, let dd = d.mData else { continue }
+            memcpy(dd, sd, Int(min(s.mDataByteSize, d.mDataByteSize)))
+        }
+        preRollBuffers.append(copy)
+        preRollFrames += copy.frameLength
+        while let first = preRollBuffers.first, preRollFrames - first.frameLength >= limit {
+            preRollFrames -= first.frameLength
+            preRollBuffers.removeFirst()
         }
     }
 
